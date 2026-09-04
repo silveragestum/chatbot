@@ -1,65 +1,54 @@
-"""Meeting-room booking chatbot: LangChain + Mistral + Gradio."""
+"""Meeting-room booking chatbot: LangChain agent + Mistral + Gradio + SQLite."""
 
 from __future__ import annotations
 
 import os
-import time
+import re
 from datetime import date, datetime, timedelta
 from typing import Any
 
 import gradio as gr
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_mistralai import ChatMistralAI
 
+from db import (
+    CLOSE_TIME,
+    OPEN_TIME,
+    ROOMS,
+    find_conflicts,
+    insert_booking,
+    list_all_bookings,
+)
+
 load_dotenv()
 
-ROOMS = [
-    {
-        "id": "aurora",
-        "name": "Aurora",
-        "capacity": 4,
-        "features": ["TV", "whiteboard", "video conferencing"],
-    },
-    {
-        "id": "harbor",
-        "name": "Harbor",
-        "capacity": 8,
-        "features": ["projector", "whiteboard", "phone"],
-    },
-    {
-        "id": "summit",
-        "name": "Summit",
-        "capacity": 16,
-        "features": ["video conferencing", "projector", "catering table"],
-    },
-    {
-        "id": "nook",
-        "name": "Nook",
-        "capacity": 2,
-        "features": ["quiet booth", "webcam"],
-    },
-]
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
 
-# In-memory bookings: (room_id, date_iso, start_hhmm, end_hhmm) -> client name
-BOOKINGS: dict[tuple[str, str, str, str], str] = {}
+SYSTEM_PROMPT = """You are Calle, a meeting-room booking assistant.
 
-SYSTEM_PROMPT = """You are Calle, a professional meeting-room booking assistant for clients.
+Rooms: A, B, and C. Hours: 09:00–21:00 (9am–9pm). Times are local 24-hour clock.
 
-Your job is to:
-- Help clients find a suitable meeting room
-- Check availability
-- Book, update, or cancel reservations
-- Confirm details clearly (room, date, time, attendee count, client name)
+You MUST extract these fields from the user before saving:
+1) person name
+2) email
+3) meeting purpose
+4) booking date
+5) start time
+6) end time
+7) meeting room number (A, B, or C)
 
-Available rooms: Aurora (4), Harbor (8), Summit (16), Nook (2).
-Hours: 08:00–18:00, weekdays. Times are 24-hour local time.
+Ask for anything that is missing. Do not invent an email, purpose, or name.
 
-Always collect: client name, date, start time, end time, number of attendees, and any equipment needs.
-Use the tools to list rooms, check availability, book, and cancel. Do not invent bookings.
-If something is unavailable, suggest alternatives.
-Be concise, courteous, and confirm the final reservation in a short summary.
+When all seven fields are present, call save_booking. That tool writes to SQLite only if
+the slot does not overlap an existing booking in the same room on the same date.
+If the tool reports a conflict or rejection, tell the user clearly that the booking was
+NOT saved and suggest another room or time. Never claim a booking succeeded unless
+save_booking returned a success message.
+
+You may also call check_availability or list_bookings to help the user.
 """
 
 
@@ -89,142 +78,148 @@ def _parse_time(value: str) -> str:
     raise ValueError(f"Could not parse time '{value}'. Use HH:MM.")
 
 
-def _overlaps(start_a: str, end_a: str, start_b: str, end_b: str) -> bool:
-    return start_a < end_b and start_b < end_a
+def _normalize_room(room: str) -> str | None:
+    key = room.strip().upper()
+    if key.startswith("ROOM"):
+        key = key.replace("ROOM", "", 1).strip()
+    if key in ROOMS:
+        return key
+    return None
 
 
-def _find_room(name_or_id: str) -> dict[str, Any] | None:
-    key = name_or_id.strip().lower()
-    for room in ROOMS:
-        if room["id"] == key or room["name"].lower() == key:
-            return room
+def _hours_ok(start: str, end: str) -> str | None:
+    if start >= end:
+        return "Start time must be before end time."
+    if start < OPEN_TIME or end > CLOSE_TIME:
+        return f"Bookings are only allowed between {OPEN_TIME} and {CLOSE_TIME}."
     return None
 
 
 @tool
 def list_rooms() -> str:
-    """List meeting rooms with capacity and features."""
-    lines = []
-    for room in ROOMS:
-        features = ", ".join(room["features"])
-        lines.append(
-            f"- {room['name']} (id: {room['id']}): seats {room['capacity']}; {features}"
-        )
-    return "\n".join(lines)
-
-
-@tool
-def check_availability(room: str, date: str, start_time: str, end_time: str) -> str:
-    """Check if a named room is free for a date and time range."""
-    try:
-        day = _parse_date(date)
-        start = _parse_time(start_time)
-        end = _parse_time(end_time)
-    except ValueError as exc:
-        return str(exc)
-    found = _find_room(room)
-    if not found:
-        return f"Unknown room '{room}'. Use list_rooms to see options."
-    if start >= end:
-        return "Start time must be before end time."
-    conflicts = [
-        f"{s}-{e} ({client})"
-        for (rid, d, s, e), client in BOOKINGS.items()
-        if rid == found["id"] and d == day and _overlaps(start, end, s, e)
-    ]
-    if conflicts:
-        return f"{found['name']} is NOT available on {day} {start}-{end}. Conflicts: {', '.join(conflicts)}."
-    return f"{found['name']} is available on {day} from {start} to {end}."
-
-
-@tool
-def book_room(
-    room: str,
-    date: str,
-    start_time: str,
-    end_time: str,
-    client_name: str,
-    attendees: int = 1,
-) -> str:
-    """Book a meeting room for a client. Fails if the slot is taken or the room is too small."""
-    try:
-        day = _parse_date(date)
-        start = _parse_time(start_time)
-        end = _parse_time(end_time)
-    except ValueError as exc:
-        return str(exc)
-    found = _find_room(room)
-    if not found:
-        return f"Unknown room '{room}'."
-    if attendees > found["capacity"]:
-        return (
-            f"{found['name']} only seats {found['capacity']}. "
-            "Choose a larger room such as Harbor or Summit."
-        )
-    if start >= end:
-        return "Start time must be before end time."
-    for (rid, d, s, e), existing in BOOKINGS.items():
-        if rid == found["id"] and d == day and _overlaps(start, end, s, e):
-            return f"Cannot book: {found['name']} is held by {existing} ({s}-{e})."
-    BOOKINGS[(found["id"], day, start, end)] = client_name.strip()
+    """List the three meeting rooms and opening hours."""
     return (
-        f"Booked {found['name']} on {day} {start}-{end} for {client_name} "
-        f"({attendees} attendee(s))."
+        f"Meeting rooms: A, B, C. Allowed times: {OPEN_TIME}–{CLOSE_TIME} (9am–9pm)."
     )
 
 
 @tool
-def cancel_booking(room: str, date: str, start_time: str, client_name: str) -> str:
-    """Cancel an existing booking for a client."""
+def check_availability(room: str, date: str, start_time: str, end_time: str) -> str:
+    """Check whether room A, B, or C is free for a date and time range."""
     try:
         day = _parse_date(date)
         start = _parse_time(start_time)
+        end = _parse_time(end_time)
     except ValueError as exc:
         return str(exc)
-    found = _find_room(room)
-    if not found:
-        return f"Unknown room '{room}'."
-    for key, existing in list(BOOKINGS.items()):
-        rid, d, s, _e = key
-        if rid == found["id"] and d == day and s == start:
-            if existing.lower() != client_name.strip().lower():
-                return f"Booking exists but is under '{existing}', not '{client_name}'."
-            del BOOKINGS[key]
-            return f"Cancelled {found['name']} on {day} at {start} for {existing}."
-    return "No matching booking found."
+    room_number = _normalize_room(room)
+    if room_number is None:
+        return f"Unknown room '{room}'. Use A, B, or C."
+    hours_error = _hours_ok(start, end)
+    if hours_error:
+        return hours_error
+    conflicts = find_conflicts(room_number, day, start, end)
+    if conflicts:
+        details = ", ".join(
+            f"{row['start_time']}-{row['end_time']} ({row['person_name']})"
+            for row in conflicts
+        )
+        return (
+            f"CONFLICT: Room {room_number} is NOT available on {day} {start}-{end}. "
+            f"Existing: {details}."
+        )
+    return f"Room {room_number} is available on {day} from {start} to {end}."
+
+
+@tool
+def save_booking(
+    person_name: str,
+    email: str,
+    purpose: str,
+    date: str,
+    start_time: str,
+    end_time: str,
+    room_number: str,
+) -> str:
+    """Save a booking to SQLite after conflict checks.
+
+    Required: person name, email, meeting purpose, date, start time, end time, room (A/B/C).
+    Rejects and does not write if the room/time overlaps an existing booking or is outside hours.
+    """
+    try:
+        day = _parse_date(date)
+        start = _parse_time(start_time)
+        end = _parse_time(end_time)
+    except ValueError as exc:
+        return f"REJECTED: {exc}"
+    room = _normalize_room(room_number)
+    if room is None:
+        return "REJECTED: Room must be A, B, or C."
+    name = person_name.strip()
+    mail = email.strip()
+    why = purpose.strip()
+    if not name:
+        return "REJECTED: Name is required."
+    if not EMAIL_RE.match(mail):
+        return "REJECTED: A valid email is required."
+    if not why:
+        return "REJECTED: Meeting purpose is required."
+    hours_error = _hours_ok(start, end)
+    if hours_error:
+        return f"REJECTED: {hours_error}"
+    conflicts = find_conflicts(room, day, start, end)
+    if conflicts:
+        details = ", ".join(
+            f"{row['start_time']}-{row['end_time']} booked by {row['person_name']} "
+            f"({row['purpose']})"
+            for row in conflicts
+        )
+        return (
+            f"REJECTED: conflict on room {room} for {day} {start}-{end}. "
+            f"Not saved. Overlaps: {details}."
+        )
+    booking_id = insert_booking(name, mail, why, day, start, end, room)
+    return (
+        f"SAVED booking #{booking_id}: {name} <{mail}> room {room} on {day} "
+        f"{start}-{end} for '{why}'."
+    )
 
 
 @tool
 def list_bookings() -> str:
-    """List all current in-memory bookings."""
-    if not BOOKINGS:
-        return "No bookings yet."
+    """List bookings stored in the SQLite database."""
+    rows = list_all_bookings()
+    if not rows:
+        return "No bookings in the database yet."
     lines = []
-    for (rid, d, s, e), client in sorted(BOOKINGS.items(), key=lambda item: item[0][1:]):
-        name = next(r["name"] for r in ROOMS if r["id"] == rid)
-        lines.append(f"- {name} on {d} {s}-{e}: {client}")
+    for row in rows:
+        lines.append(
+            f"- #{row['id']} room {row['room_number']} {row['booking_date']} "
+            f"{row['start_time']}-{row['end_time']}: {row['person_name']} "
+            f"<{row['email']}> — {row['purpose']}"
+        )
     return "\n".join(lines)
 
 
-TOOLS = [list_rooms, check_availability, book_room, cancel_booking, list_bookings]
+TOOLS = [list_rooms, check_availability, save_booking, list_bookings]
 
 
-def _build_llm() -> Any:
+def _build_agent():
     api_key = os.getenv("MISTRAL_API_KEY")
     if not api_key:
         raise RuntimeError(
             "MISTRAL_API_KEY is not set. Export it or put it in a .env file."
         )
-    return ChatMistralAI(
+    model = ChatMistralAI(
         model="mistral-small-latest",
         api_key=api_key,
-        temperature=0.3,
-    ).bind_tools(TOOLS)
+        temperature=0.2,
+    )
+    return create_agent(model=model, tools=TOOLS, system_prompt=SYSTEM_PROMPT)
 
 
-def _run_agent(user_message: str, history: list[dict[str, str]]) -> str:
-    llm = _build_llm()
-    messages: list[Any] = [SystemMessage(content=SYSTEM_PROMPT)]
+def _history_to_messages(history: list[dict[str, str]]) -> list[Any]:
+    messages: list[Any] = []
     for turn in history:
         role = turn.get("role")
         content = turn.get("content") or ""
@@ -232,43 +227,17 @@ def _run_agent(user_message: str, history: list[dict[str, str]]) -> str:
             messages.append(HumanMessage(content=content))
         elif role == "assistant":
             messages.append(AIMessage(content=content))
-    messages.append(HumanMessage(content=user_message))
+    return messages
 
-    tool_map = {t.name: t for t in TOOLS}
-    for _ in range(8):
-        response = None
-        last_error: Exception | None = None
-        for attempt in range(4):
-            try:
-                response = llm.invoke(messages)
-                break
-            except Exception as exc:  # noqa: BLE001
-                last_error = exc
-                text = str(exc).lower()
-                if "429" in text or "rate limit" in text:
-                    time.sleep(2 ** attempt)
-                    continue
-                raise
-        if response is None:
-            raise last_error or RuntimeError("Mistral request failed")
-        messages.append(response)
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
-            return response.content if isinstance(response.content, str) else str(
-                response.content
-            )
-        for call in tool_calls:
-            name = call["name"]
-            args = call.get("args") or {}
-            tool_fn = tool_map.get(name)
-            if tool_fn is None:
-                result = f"Unknown tool: {name}"
-            else:
-                result = tool_fn.invoke(args)
-            messages.append(
-                ToolMessage(content=str(result), tool_call_id=call["id"])
-            )
-    return "I needed too many tool steps. Please restate your booking request."
+
+def _run_agent(user_message: str, history: list[dict[str, str]]) -> str:
+    agent = _build_agent()
+    messages = _history_to_messages(history)
+    messages.append(HumanMessage(content=user_message))
+    result = agent.invoke({"messages": messages})
+    final = result["messages"][-1]
+    content = getattr(final, "content", final)
+    return content if isinstance(content, str) else str(content)
 
 
 def chat(message: str, history: list[dict[str, str]]) -> str:
@@ -283,15 +252,15 @@ def build_ui() -> gr.Blocks:
         gr.Markdown(
             """
             # Calle — Meeting Room Booking
-            Chat to check availability and book Aurora, Harbor, Summit, or Nook.
+            Rooms **A, B, C** · 09:00–21:00 · Bookings saved to SQLite when the slot is free.
             """
         )
         gr.ChatInterface(
             fn=chat,
             examples=[
-                "What rooms do you have?",
-                "Book Harbor tomorrow 10:00-11:30 for Acme, 6 people.",
-                "Is Summit free today from 14:00 to 15:00?",
+                "What rooms can I book?",
+                "Book room B tomorrow 10:00-11:30. I'm Ada Lovelace, ada@example.com, purpose: product review.",
+                "Show current bookings.",
             ],
         )
     return demo

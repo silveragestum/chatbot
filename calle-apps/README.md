@@ -1,6 +1,6 @@
 # Calle Apps — Meeting Room Chatbot
 
-A Gradio chatbot that books meeting rooms for clients. It uses LangChain with Mistral and an in-memory room calendar.
+A Gradio chatbot that books meeting rooms for clients. A LangChain agent extracts booking details and a `save_booking` tool writes them to SQLite only when there is no conflict.
 
 ## Setup
 
@@ -15,13 +15,16 @@ python app.py
 
 Open the Gradio URL (default `http://127.0.0.1:7860`).
 
-## Rooms
+## Rooms and hours
 
-| Room   | Capacity | Features |
-|--------|----------|----------|
-| Aurora | 4        | TV, whiteboard, video conferencing |
-| Harbor | 8        | projector, whiteboard, phone |
-| Summit | 16       | video conferencing, projector, catering table |
-| Nook   | 2        | quiet booth, webcam |
+Rooms **A**, **B**, and **C**. Bookings allowed **09:00–21:00**.
 
-Bookings live in process memory and reset when the app restarts.
+Each saved row includes: person name, email, meeting purpose, date, start time, end time, and room number.
+
+Overlapping times on the same room and date are rejected and not stored. The database file is `calle-apps/bookings.db`.
+
+## Tests
+
+```bash
+python -m unittest test_booking.py
+```
