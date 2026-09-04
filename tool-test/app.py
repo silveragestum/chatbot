@@ -10,17 +10,24 @@ import smtplib
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
+from langchain_community.document_loaders import PyPDFLoader
+from langchain_chroma import Chroma
 from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
+from langchain_huggingface import HuggingFaceEmbeddings
 from langchain_mistralai import ChatMistralAI
+from langchain_text_splitters import RecursiveCharacterTextSplitter
 import gradio as gr
 
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
+POLICY_FILENAME = "Unisoft Human Resources Policy.pdf"
+CHROMA_DIR = ROOT / "chroma_unisoft_hr"
+_vectorstore = None
 
-SYSTEM_PROMPT = """You are an HR assistant that processes holiday / leave applications.
+SYSTEM_PROMPT = """You are an HR assistant for Unisoft.
 
-Your job:
+Holiday / leave applications:
 1. Extract these key fields from the conversation (ask for any that are missing):
    - User name
    - Email
@@ -39,9 +46,14 @@ Your job:
    Gmail confirmation is sent to the applicant. Do not send email before they confirm.
    After the tool runs, tell the user whether the email was sent.
 
-Working days are Monday through Friday only. Do not invent holidays.
+Unisoft policy questions:
+For any question about Unisoft HR rules, leave entitlements, working hours, sick leave,
+remote work, probation, conduct, or this company policy, you MUST call
+search_unisoft_hr_policy with the user's question. Answer using only the retrieved
+policy text. If the retrieved text does not contain the answer, say the Unisoft Human
+Resources Policy does not specify it. Do not invent policy.
 
-For other HR questions that are not a holiday application, answer normally.
+Working days are Monday through Friday only. Do not invent holidays.
 This is general guidance, not legal advice.
 """
 
@@ -53,6 +65,49 @@ DATE_FORMATS = (
     "%Y/%m/%d",
     "%d.%m.%Y",
 )
+
+
+def find_policy_pdf() -> Path:
+    candidates = [
+        ROOT / POLICY_FILENAME,
+        ROOT.parent / POLICY_FILENAME,
+        Path.cwd() / POLICY_FILENAME,
+    ]
+    for path in candidates:
+        if path.is_file():
+            return path
+    raise FileNotFoundError(
+        f"Could not find {POLICY_FILENAME} in {ROOT}, {ROOT.parent}, or {Path.cwd()}."
+    )
+
+
+def get_vectorstore() -> Chroma:
+    global _vectorstore
+    if _vectorstore is not None:
+        return _vectorstore
+    pdf_path = find_policy_pdf()
+    embeddings = HuggingFaceEmbeddings(
+        model_name="sentence-transformers/all-MiniLM-L6-v2"
+    )
+    if CHROMA_DIR.exists() and any(CHROMA_DIR.iterdir()):
+        _vectorstore = Chroma(
+            persist_directory=str(CHROMA_DIR),
+            embedding_function=embeddings,
+            collection_name="unisoft_hr_policy",
+        )
+        return _vectorstore
+    loader = PyPDFLoader(str(pdf_path))
+    documents = loader.load()
+    splitter = RecursiveCharacterTextSplitter(chunk_size=700, chunk_overlap=120)
+    chunks = splitter.split_documents(documents)
+    CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+    _vectorstore = Chroma.from_documents(
+        documents=chunks,
+        embedding=embeddings,
+        persist_directory=str(CHROMA_DIR),
+        collection_name="unisoft_hr_policy",
+    )
+    return _vectorstore
 
 
 def load_api_key() -> str:
@@ -279,7 +334,28 @@ def send_confirmation_email(
         return f"Could not send confirmation email: {exc}"
 
 
-TOOLS = [count_working_days, record_holiday_application, send_confirmation_email]
+@tool
+def search_unisoft_hr_policy(question: str) -> str:
+    """Search the Unisoft Human Resources Policy PDF (Chroma vector store) for answers.
+
+    Use this for any question about Unisoft leave, hours, conduct, remote work, or HR rules.
+
+    Args:
+        question: The employee's question about the Unisoft HR policy.
+    """
+    store = get_vectorstore()
+    docs = store.similarity_search((question or "").strip(), k=4)
+    if not docs:
+        return "No matching passages were found in Unisoft Human Resources Policy.pdf."
+    parts = []
+    for i, doc in enumerate(docs, start=1):
+        page = doc.metadata.get("page")
+        page_note = f" (page {page + 1})" if isinstance(page, int) else ""
+        parts.append(f"Passage {i}{page_note}:\n{doc.page_content.strip()}")
+    return "\n\n".join(parts)
+
+
+TOOLS = [count_working_days, record_holiday_application, send_confirmation_email, search_unisoft_hr_policy]
 
 api_key = load_api_key()
 
@@ -393,9 +469,11 @@ def chat(
 with gr.Blocks(title="HR Assistant") as demo:
     gr.Markdown(
         "## HR Assistant\n"
-        "Apply for holiday leave in chat. The agent extracts **User name**, **Email**, "
-        "**Purpose**, **Start Date**, and **End Date**, counts **working days** "
-        "(Monday to Friday), asks you to confirm, then sends a **Gmail confirmation**.\n\n"
+        "Apply for holiday leave in chat, or ask any question about the "
+        "**Unisoft Human Resources Policy** (RAG over Unisoft Human Resources Policy.pdf). "
+        "The agent extracts **User name**, **Email**, **Purpose**, **Start Date**, and **End Date**, "
+        "counts **working days** (Monday to Friday), asks you to confirm, then can send a "
+        "**Gmail confirmation**.\n\n"
         "Create a Gmail App Password at [myaccount.google.com/apppasswords]"
         "(https://myaccount.google.com/apppasswords) (2-Step Verification required)."
     )
@@ -449,9 +527,9 @@ with gr.Blocks(title="HR Assistant") as demo:
                 "2026-09-15",
             ],
             [
-                "Please process my holiday: Alex Chen, alex.chen@company.com, medical appointment, 2026-10-05 to 2026-10-07.",
-                "2026-10-05",
-                "2026-10-07",
+                "How many annual leave days do Unisoft employees get in their first year?",
+                "",
+                "",
             ],
         ],
         inputs=[msg_in, start_in, end_in],
