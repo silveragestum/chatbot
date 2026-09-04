@@ -288,7 +288,6 @@ def build_ui() -> gr.Blocks:
         )
         gr.ChatInterface(
             fn=chat,
-            type="messages",
             examples=[
                 "What rooms do you have?",
                 "Book Harbor tomorrow 10:00-11:30 for Acme, 6 people.",
