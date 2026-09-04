@@ -1,12 +1,14 @@
-"""HR assistant chatbot: LangChain + Mistral + Gradio."""
+"""HR assistant chatbot: LangChain agent + Mistral + Gradio."""
 
 from datetime import date, datetime, timedelta
 import json
 import os
 from pathlib import Path
+import re
 
 from dotenv import load_dotenv
-from langchain_core.messages import AIMessage, HumanMessage, SystemMessage, ToolMessage
+from langchain.agents import create_agent
+from langchain_core.messages import AIMessage, HumanMessage
 from langchain_core.tools import tool
 from langchain_mistralai import ChatMistralAI
 import gradio as gr
@@ -14,17 +16,28 @@ import gradio as gr
 ROOT = Path(__file__).resolve().parent
 load_dotenv(ROOT / ".env")
 
-SYSTEM_PROMPT = (
-    "You are an HR assistant. Help employees and managers with human-resources "
-    "questions: policies, leave, benefits, hiring, onboarding, performance, "
-    "workplace conduct, and related processes. Be clear, professional, and "
-    "practical. If a question is outside HR, say so and steer back to HR topics. "
-    "This is general guidance, not legal advice. "
-    "When the user asks how many working days are in a date range, or provides "
-    "a start date and end date for leave or attendance, you MUST call the "
-    "count_working_days tool. Do not count the days yourself. Working days are "
-    "Monday through Friday, inclusive of both dates, excluding Saturday and Sunday."
-)
+SYSTEM_PROMPT = """You are an HR assistant that processes holiday / leave applications.
+
+Your job:
+1. Extract these key fields from the conversation (ask for any that are missing):
+   - User name
+   - Email
+   - Purpose (reason for leave)
+   - Start Date
+   - End Date
+2. When you have both Start Date and End Date, you MUST call the count_working_days tool.
+   Never count working days yourself.
+3. When you have all five fields, you MUST call record_holiday_application with the extracted values.
+4. Then show the user a clear confirmation of:
+   User name, Email, Purpose, Start Date, End Date, and the working-day count
+   (Monday to Friday, inclusive). Ask them to confirm whether the information is correct.
+   If they say it is wrong, collect the corrections and call the tools again.
+
+Working days are Monday through Friday only. Do not invent holidays.
+
+For other HR questions that are not a holiday application, answer normally.
+This is general guidance, not legal advice.
+"""
 
 DATE_FORMATS = (
     "%Y-%m-%d",
@@ -78,8 +91,8 @@ def count_working_days(start_date: str, end_date: str) -> str:
     """Count Monday-Friday working days between two dates, inclusive.
 
     Args:
-        start_date: Start of the range (YYYY-MM-DD preferred).
-        end_date: End of the range (YYYY-MM-DD preferred).
+        start_date: Leave start date (YYYY-MM-DD preferred).
+        end_date: Leave end date (YYYY-MM-DD preferred).
     """
     start = parse_date(start_date)
     end = parse_date(end_date)
@@ -94,12 +107,65 @@ def count_working_days(start_date: str, end_date: str) -> str:
     )
 
 
-TOOLS = [count_working_days]
-TOOLS_BY_NAME = {t.name: t for t in TOOLS}
+@tool
+def record_holiday_application(
+    user_name: str,
+    email: str,
+    purpose: str,
+    start_date: str,
+    end_date: str,
+) -> str:
+    """Save holiday application fields extracted from the conversation and attach the working-day count.
+
+    Call this only after User name, Email, Purpose, Start Date, and End Date are known.
+
+    Args:
+        user_name: Applicant's full name.
+        email: Applicant's email address.
+        purpose: Reason for the holiday or leave.
+        start_date: First day of leave (YYYY-MM-DD preferred).
+        end_date: Last day of leave (YYYY-MM-DD preferred).
+    """
+    name = (user_name or "").strip()
+    mail = (email or "").strip()
+    reason = (purpose or "").strip()
+    missing = [
+        label
+        for label, value in (
+            ("User name", name),
+            ("Email", mail),
+            ("Purpose", reason),
+            ("Start Date", start_date),
+            ("End Date", end_date),
+        )
+        if not value
+    ]
+    if missing:
+        return f"Missing fields: {', '.join(missing)}. Ask the user for these before confirming."
+    if not re.search(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", mail):
+        return f"Email '{mail}' does not look valid. Ask the user for a correct email."
+    working = count_working_days.invoke(
+        {"start_date": start_date, "end_date": end_date}
+    )
+    start = parse_date(start_date)
+    end = parse_date(end_date)
+    ordered_start, ordered_end = (start, end) if start <= end else (end, start)
+    return (
+        "Holiday application draft\n"
+        f"- User name: {name}\n"
+        f"- Email: {mail}\n"
+        f"- Purpose: {reason}\n"
+        f"- Start Date: {ordered_start.isoformat()}\n"
+        f"- End Date: {ordered_end.isoformat()}\n"
+        f"- Working days: {working}\n"
+        "Ask the user to confirm whether this information is correct."
+    )
+
+
+TOOLS = [count_working_days, record_holiday_application]
 
 api_key = load_api_key()
 
-# mistral-small-latest hits rate limits on this account; these models work.
 MODEL_CANDIDATES = (
     "open-mistral-nemo",
     "mistral-tiny",
@@ -111,9 +177,13 @@ def _llm(model: str) -> ChatMistralAI:
     return ChatMistralAI(
         model=model,
         api_key=api_key,
-        temperature=0.2,
+        temperature=0.1,
         max_retries=2,
-    ).bind_tools(TOOLS)
+    )
+
+
+def _agent(model: str):
+    return create_agent(_llm(model), tools=TOOLS, system_prompt=SYSTEM_PROMPT)
 
 
 def _message_text(content) -> str:
@@ -132,28 +202,23 @@ def _message_text(content) -> str:
     return str(content)
 
 
-def _run_with_tools(llm, messages: list) -> str:
-    response = llm.invoke(messages)
-    for _ in range(6):
-        tool_calls = getattr(response, "tool_calls", None) or []
-        if not tool_calls:
-            text = _message_text(response.content).strip()
-            return text or "I could not produce a reply. Please try again."
-        messages.append(response)
-        for call in tool_calls:
-            tool_fn = TOOLS_BY_NAME.get(call["name"])
-            if tool_fn is None:
-                result = f"Unknown tool: {call['name']}"
-            else:
-                try:
-                    result = tool_fn.invoke(call["args"])
-                except Exception as exc:
-                    result = f"Tool error: {exc}"
-            messages.append(
-                ToolMessage(content=str(result), tool_call_id=call["id"])
-            )
-        response = llm.invoke(messages)
-    return _message_text(response.content).strip() or "Please try that question again."
+def _history_messages(history: list, user_text: str) -> list:
+    messages = []
+    for turn in history:
+        if isinstance(turn, dict):
+            role, content = turn.get("role"), turn.get("content", "")
+            if role == "user":
+                messages.append(HumanMessage(content=content))
+            elif role == "assistant":
+                messages.append(AIMessage(content=content))
+        elif isinstance(turn, (list, tuple)) and len(turn) == 2:
+            user_turn, assistant_text = turn
+            if user_turn:
+                messages.append(HumanMessage(content=user_turn))
+            if assistant_text:
+                messages.append(AIMessage(content=assistant_text))
+    messages.append(HumanMessage(content=user_text))
+    return messages
 
 
 def _normalize_date_input(value) -> str:
@@ -170,38 +235,23 @@ def chat(message: str, history: list | None, start_date=None, end_date=None) -> 
     history = history or []
     start_date = _normalize_date_input(start_date)
     end_date = _normalize_date_input(end_date)
-    user_text = message or ""
-    if start_date and end_date:
-        user_text = (
-            f"{user_text}\n\nStart date: {start_date}\nEnd date: {end_date}\n"
-            "Use the count_working_days tool with these dates."
-        ).strip()
-    elif start_date or end_date:
-        user_text = (
-            f"{user_text}\n\nPartial dates provided — start: {start_date or '(missing)'}, "
-            f"end: {end_date or '(missing)'}. Ask for the missing date if needed."
-        ).strip()
+    user_text = (message or "").strip()
+    extras = []
+    if start_date:
+        extras.append(f"Start Date: {start_date}")
+    if end_date:
+        extras.append(f"End Date: {end_date}")
+    if extras:
+        user_text = f"{user_text}\n\n" + "\n".join(extras) if user_text else "\n".join(extras)
 
-    messages = [SystemMessage(content=SYSTEM_PROMPT)]
-    for turn in history:
-        if isinstance(turn, dict):
-            role, content = turn.get("role"), turn.get("content", "")
-            if role == "user":
-                messages.append(HumanMessage(content=content))
-            elif role == "assistant":
-                messages.append(AIMessage(content=content))
-        elif isinstance(turn, (list, tuple)) and len(turn) == 2:
-            user_turn, assistant_text = turn
-            if user_turn:
-                messages.append(HumanMessage(content=user_turn))
-            if assistant_text:
-                messages.append(AIMessage(content=assistant_text))
-    messages.append(HumanMessage(content=user_text))
-
+    messages = _history_messages(history, user_text)
     last_error = None
     for model in MODEL_CANDIDATES:
         try:
-            return _run_with_tools(_llm(model), list(messages))
+            result = _agent(model).invoke({"messages": messages})
+            final = result["messages"][-1]
+            text = _message_text(getattr(final, "content", final)).strip()
+            return text or "I could not produce a reply. Please try again."
         except Exception as exc:
             last_error = exc
             text = str(exc)
@@ -217,8 +267,9 @@ def chat(message: str, history: list | None, start_date=None, end_date=None) -> 
 with gr.Blocks(title="HR Assistant") as demo:
     gr.Markdown(
         "## HR Assistant\n"
-        "Ask HR questions, or enter a **start date** and **end date** to count "
-        "working days (Monday to Friday)."
+        "Apply for holiday leave in chat. The agent extracts **User name**, **Email**, "
+        "**Purpose**, **Start Date**, and **End Date**, counts **working days** "
+        "(Monday to Friday), then asks you to confirm."
     )
     chatbot = gr.Chatbot(height=480)
     with gr.Row():
@@ -226,7 +277,7 @@ with gr.Blocks(title="HR Assistant") as demo:
         end_in = gr.Textbox(label="End date", placeholder="YYYY-MM-DD")
     msg_in = gr.Textbox(
         label="Message",
-        placeholder="Ask an HR question or how many working days are in the date range",
+        placeholder="e.g. I am Jane Doe, jane@acme.com. Annual leave 1–15 Sep 2026 for a family trip.",
     )
     send = gr.Button("Send", variant="primary")
 
@@ -236,7 +287,7 @@ with gr.Blocks(title="HR Assistant") as demo:
             return history, message
         display = (message or "").strip()
         if start_date and end_date:
-            display = display or f"Working days from {start_date} to {end_date}"
+            display = display or f"Holiday dates from {start_date} to {end_date}"
         reply = chat(message, history, start_date, end_date)
         history = history + [
             {"role": "user", "content": display},
@@ -250,9 +301,16 @@ with gr.Blocks(title="HR Assistant") as demo:
 
     gr.Examples(
         examples=[
-            ["How many working days between these dates?", "2026-09-01", "2026-09-15"],
-            ["What should I include in an onboarding checklist?", "", ""],
-            ["How do I handle a conflict between two teammates?", "", ""],
+            [
+                "I am Jane Doe, jane@acme.com. I want annual leave from 2026-09-01 to 2026-09-15 for a family trip.",
+                "2026-09-01",
+                "2026-09-15",
+            ],
+            [
+                "Please process my holiday: Alex Chen, alex.chen@company.com, medical appointment, 2026-10-05 to 2026-10-07.",
+                "2026-10-05",
+                "2026-10-07",
+            ],
         ],
         inputs=[msg_in, start_in, end_in],
     )
