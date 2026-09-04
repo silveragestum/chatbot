@@ -1,10 +1,12 @@
 """HR assistant chatbot: LangChain agent + Mistral + Gradio."""
 
 from datetime import date, datetime, timedelta
+from email.message import EmailMessage
 import json
 import os
 from pathlib import Path
 import re
+import smtplib
 
 from dotenv import load_dotenv
 from langchain.agents import create_agent
@@ -32,6 +34,10 @@ Your job:
    User name, Email, Purpose, Start Date, End Date, and the working-day count
    (Monday to Friday, inclusive). Ask them to confirm whether the information is correct.
    If they say it is wrong, collect the corrections and call the tools again.
+5. ONLY after the user clearly confirms the details (for example: yes, correct, confirmed,
+   looks good), you MUST call send_confirmation_email with the confirmed fields so a
+   Gmail confirmation is sent to the applicant. Do not send email before they confirm.
+   After the tool runs, tell the user whether the email was sent.
 
 Working days are Monday through Friday only. Do not invent holidays.
 
@@ -158,11 +164,122 @@ def record_holiday_application(
         f"- Start Date: {ordered_start.isoformat()}\n"
         f"- End Date: {ordered_end.isoformat()}\n"
         f"- Working days: {working}\n"
-        "Ask the user to confirm whether this information is correct."
+        "Ask the user to confirm whether this information is correct. "
+        "Do not send email until they confirm."
     )
 
 
-TOOLS = [count_working_days, record_holiday_application]
+_runtime_gmail = {"gmail_address": "", "app_password": ""}
+
+
+def load_gmail_credentials() -> tuple[str, str]:
+    address = (
+        (_runtime_gmail.get("gmail_address") or "").strip()
+        or os.getenv("GMAIL_ADDRESS", "").strip()
+    )
+    password = (
+        (_runtime_gmail.get("app_password") or "").strip()
+        or os.getenv("GMAIL_APP_PASSWORD", "").strip()
+    )
+    config_path = ROOT / "gmail_config.json"
+    if config_path.exists() and (not address or not password):
+        data = json.loads(config_path.read_text(encoding="utf-8"))
+        address = address or str(data.get("gmail_address") or "").strip()
+        password = password or str(data.get("app_password") or "").strip()
+    return address, password.replace(" ", "")
+
+
+def build_confirmation_email_body(
+    user_name: str,
+    email: str,
+    purpose: str,
+    start_date: str,
+    end_date: str,
+    working_days: str,
+) -> str:
+    return (
+        f"Hello {user_name},\n\n"
+        "This is confirmation of your holiday / leave application.\n\n"
+        f"User name: {user_name}\n"
+        f"Email: {email}\n"
+        f"Purpose: {purpose}\n"
+        f"Start Date: {start_date}\n"
+        f"End Date: {end_date}\n"
+        f"Working days (Monday to Friday): {working_days}\n\n"
+        "If anything is incorrect, reply to HR.\n\n"
+        "HR Assistant\n"
+    )
+
+
+def send_gmail_message(to_email: str, subject: str, body: str) -> str:
+    address, password = load_gmail_credentials()
+    if not address or not password:
+        return (
+            "Gmail is not configured. Create a Google App Password at "
+            "https://myaccount.google.com/apppasswords then set GMAIL_ADDRESS and "
+            "GMAIL_APP_PASSWORD, fill tool-test/gmail_config.json, or enter them in the UI."
+        )
+    message = EmailMessage()
+    message["From"] = address
+    message["To"] = to_email
+    message["Subject"] = subject
+    message.set_content(body)
+    with smtplib.SMTP("smtp.gmail.com", 587, timeout=30) as smtp:
+        smtp.starttls()
+        smtp.login(address, password)
+        smtp.send_message(message)
+    return f"Confirmation email sent to {to_email} from {address}."
+
+
+@tool
+def send_confirmation_email(
+    user_name: str,
+    email: str,
+    purpose: str,
+    start_date: str,
+    end_date: str,
+    working_days: str,
+) -> str:
+    """Send a holiday confirmation email via Gmail after the user confirms the details.
+
+    Call this only when the user has confirmed that User name, Email, Purpose,
+    Start Date, End Date, and working days are correct.
+
+    Args:
+        user_name: Confirmed applicant name.
+        email: Applicant email address (recipient).
+        purpose: Confirmed leave purpose.
+        start_date: Confirmed start date.
+        end_date: Confirmed end date.
+        working_days: Working-day count already calculated by count_working_days.
+    """
+    mail = (email or "").strip()
+    if not re.search(r"^[^@\s]+@[^@\s]+\.[^@\s]+$", mail):
+        return f"Cannot send email: '{email}' is not a valid address."
+    body = build_confirmation_email_body(
+        user_name=user_name.strip(),
+        email=mail,
+        purpose=(purpose or "").strip(),
+        start_date=(start_date or "").strip(),
+        end_date=(end_date or "").strip(),
+        working_days=(working_days or "").strip(),
+    )
+    try:
+        return send_gmail_message(
+            to_email=mail,
+            subject="Holiday application confirmation",
+            body=body,
+        )
+    except smtplib.SMTPAuthenticationError:
+        return (
+            "Gmail login failed. Use an App Password (not your normal Gmail password) from "
+            "https://myaccount.google.com/apppasswords and make sure 2-Step Verification is on."
+        )
+    except Exception as exc:
+        return f"Could not send confirmation email: {exc}"
+
+
+TOOLS = [count_working_days, record_holiday_application, send_confirmation_email]
 
 api_key = load_api_key()
 
@@ -229,10 +346,19 @@ def _normalize_date_input(value) -> str:
     return str(value).strip()
 
 
-def chat(message: str, history: list | None, start_date=None, end_date=None) -> str:
+def chat(
+    message: str,
+    history: list | None,
+    start_date=None,
+    end_date=None,
+    gmail_address=None,
+    gmail_app_password=None,
+) -> str:
     if isinstance(message, dict):
         message = str(message.get("text") or message.get("content") or "")
     history = history or []
+    _runtime_gmail["gmail_address"] = (gmail_address or "").strip()
+    _runtime_gmail["app_password"] = (gmail_app_password or "").strip()
     start_date = _normalize_date_input(start_date)
     end_date = _normalize_date_input(end_date)
     user_text = (message or "").strip()
@@ -269,33 +395,49 @@ with gr.Blocks(title="HR Assistant") as demo:
         "## HR Assistant\n"
         "Apply for holiday leave in chat. The agent extracts **User name**, **Email**, "
         "**Purpose**, **Start Date**, and **End Date**, counts **working days** "
-        "(Monday to Friday), then asks you to confirm."
+        "(Monday to Friday), asks you to confirm, then sends a **Gmail confirmation**.\n\n"
+        "Create a Gmail App Password at [myaccount.google.com/apppasswords]"
+        "(https://myaccount.google.com/apppasswords) (2-Step Verification required)."
     )
     chatbot = gr.Chatbot(height=480)
     with gr.Row():
         start_in = gr.Textbox(label="Start date", placeholder="YYYY-MM-DD")
         end_in = gr.Textbox(label="End date", placeholder="YYYY-MM-DD")
+    with gr.Accordion("Gmail (confirmation email)", open=True):
+        gmail_in = gr.Textbox(label="Gmail address (sender)", placeholder="you@gmail.com")
+        gmail_pw = gr.Textbox(
+            label="Gmail App Password",
+            placeholder="16-character app password",
+            type="password",
+        )
     msg_in = gr.Textbox(
         label="Message",
         placeholder="e.g. I am Jane Doe, jane@acme.com. Annual leave 1–15 Sep 2026 for a family trip.",
     )
     send = gr.Button("Send", variant="primary")
 
-    def respond(message, history, start_date, end_date):
+    def respond(message, history, start_date, end_date, gmail_address, gmail_app_password):
         history = history or []
         if not (message or "").strip() and not (start_date and end_date):
             return history, message
         display = (message or "").strip()
         if start_date and end_date:
             display = display or f"Holiday dates from {start_date} to {end_date}"
-        reply = chat(message, history, start_date, end_date)
+        reply = chat(
+            message,
+            history,
+            start_date,
+            end_date,
+            gmail_address,
+            gmail_app_password,
+        )
         history = history + [
             {"role": "user", "content": display},
             {"role": "assistant", "content": reply},
         ]
         return history, ""
 
-    inputs = [msg_in, chatbot, start_in, end_in]
+    inputs = [msg_in, chatbot, start_in, end_in, gmail_in, gmail_pw]
     send.click(respond, inputs, [chatbot, msg_in])
     msg_in.submit(respond, inputs, [chatbot, msg_in])
 
