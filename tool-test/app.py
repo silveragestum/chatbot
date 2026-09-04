@@ -220,7 +220,7 @@ with gr.Blocks(title="HR Assistant") as demo:
         "Ask HR questions, or enter a **start date** and **end date** to count "
         "working days (Monday to Friday)."
     )
-    chatbot = gr.Chatbot(type="messages", height=480)
+    chatbot = gr.Chatbot(height=480)
     with gr.Row():
         start_in = gr.Textbox(label="Start date", placeholder="YYYY-MM-DD")
         end_in = gr.Textbox(label="End date", placeholder="YYYY-MM-DD")
