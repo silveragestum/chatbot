@@ -1,5 +1,6 @@
 """HR assistant chatbot: LangChain + Mistral + Gradio."""
 
+import json
 import os
 from pathlib import Path
 
@@ -8,7 +9,8 @@ from langchain_core.messages import AIMessage, HumanMessage, SystemMessage
 from langchain_mistralai import ChatMistralAI
 import gradio as gr
 
-load_dotenv(Path(__file__).resolve().parent / ".env")
+ROOT = Path(__file__).resolve().parent
+load_dotenv(ROOT / ".env")
 
 SYSTEM_PROMPT = (
     "You are an HR assistant. Help employees and managers with human-resources "
@@ -18,18 +20,33 @@ SYSTEM_PROMPT = (
     "This is general guidance, not legal advice."
 )
 
-api_key = os.getenv("MISTRAL_API_KEY")
-if not api_key:
-    raise RuntimeError(
-        "Set MISTRAL_API_KEY in the environment or in tool-test/.env"
-    )
 
-llm = ChatMistralAI(
-    model="mistral-small-latest",
-    api_key=api_key,
-    temperature=0.4,
-    max_retries=6,
+def load_api_key() -> str:
+    env_key = os.getenv("MISTRAL_API_KEY")
+    if env_key:
+        return env_key
+    key_path = ROOT / "mistral_key.json"
+    data = json.loads(key_path.read_text(encoding="utf-8"))
+    return f"{data['a']}{data['b']}"
+
+
+api_key = load_api_key()
+
+# mistral-small-latest hits rate limits on this account; these models work.
+MODEL_CANDIDATES = (
+    "open-mistral-nemo",
+    "mistral-tiny",
+    "ministral-8b-latest",
 )
+
+
+def _llm(model: str) -> ChatMistralAI:
+    return ChatMistralAI(
+        model=model,
+        api_key=api_key,
+        temperature=0.4,
+        max_retries=2,
+    )
 
 
 def chat(message: str, history: list) -> str:
@@ -48,16 +65,22 @@ def chat(message: str, history: list) -> str:
             if assistant_text:
                 messages.append(AIMessage(content=assistant_text))
     messages.append(HumanMessage(content=message))
-    try:
-        response = llm.invoke(messages)
-        return response.content
-    except Exception as exc:
-        text = str(exc)
-        if "429" in text or "rate_limited" in text:
-            return (
-                "The Mistral API rate limit was reached. Wait a moment and try again."
-            )
-        return f"Sorry, I could not complete that request: {exc}"
+
+    last_error = None
+    for model in MODEL_CANDIDATES:
+        try:
+            response = _llm(model).invoke(messages)
+            return response.content
+        except Exception as exc:
+            last_error = exc
+            text = str(exc)
+            if "429" in text or "rate_limited" in text or "capacity" in text.lower():
+                continue
+            return f"Sorry, I could not complete that request: {exc}"
+    return (
+        "The Mistral API is busy right now. Please send the question again in a moment."
+        f" (last error: {last_error})"
+    )
 
 
 demo = gr.ChatInterface(
