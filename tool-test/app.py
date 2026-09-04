@@ -164,7 +164,10 @@ def _normalize_date_input(value) -> str:
     return str(value).strip()
 
 
-def chat(message: str, history: list, start_date=None, end_date=None) -> str:
+def chat(message: str, history: list | None, start_date=None, end_date=None) -> str:
+    if isinstance(message, dict):
+        message = str(message.get("text") or message.get("content") or "")
+    history = history or []
     start_date = _normalize_date_input(start_date)
     end_date = _normalize_date_input(end_date)
     user_text = message or ""
@@ -211,23 +214,48 @@ def chat(message: str, history: list, start_date=None, end_date=None) -> str:
     )
 
 
-demo = gr.ChatInterface(
-    fn=chat,
-    title="HR Assistant",
-    description=(
-        "Ask HR questions, or enter a start date and end date to count "
+with gr.Blocks(title="HR Assistant") as demo:
+    gr.Markdown(
+        "## HR Assistant\n"
+        "Ask HR questions, or enter a **start date** and **end date** to count "
         "working days (Monday to Friday)."
-    ),
-    additional_inputs=[
-        gr.Textbox(label="Start date", placeholder="YYYY-MM-DD", value=""),
-        gr.Textbox(label="End date", placeholder="YYYY-MM-DD", value=""),
-    ],
-    examples=[
-        ["How many working days between 2026-09-01 and 2026-09-15?", "2026-09-01", "2026-09-15"],
-        ["What should I include in an onboarding checklist?", "", ""],
-        ["How do I handle a conflict between two teammates?", "", ""],
-    ],
-)
+    )
+    chatbot = gr.Chatbot(type="messages", height=480)
+    with gr.Row():
+        start_in = gr.Textbox(label="Start date", placeholder="YYYY-MM-DD")
+        end_in = gr.Textbox(label="End date", placeholder="YYYY-MM-DD")
+    msg_in = gr.Textbox(
+        label="Message",
+        placeholder="Ask an HR question or how many working days are in the date range",
+    )
+    send = gr.Button("Send", variant="primary")
+
+    def respond(message, history, start_date, end_date):
+        history = history or []
+        if not (message or "").strip() and not (start_date and end_date):
+            return history, message
+        display = (message or "").strip()
+        if start_date and end_date:
+            display = display or f"Working days from {start_date} to {end_date}"
+        reply = chat(message, history, start_date, end_date)
+        history = history + [
+            {"role": "user", "content": display},
+            {"role": "assistant", "content": reply},
+        ]
+        return history, ""
+
+    inputs = [msg_in, chatbot, start_in, end_in]
+    send.click(respond, inputs, [chatbot, msg_in])
+    msg_in.submit(respond, inputs, [chatbot, msg_in])
+
+    gr.Examples(
+        examples=[
+            ["How many working days between these dates?", "2026-09-01", "2026-09-15"],
+            ["What should I include in an onboarding checklist?", "", ""],
+            ["How do I handle a conflict between two teammates?", "", ""],
+        ],
+        inputs=[msg_in, start_in, end_in],
+    )
 
 if __name__ == "__main__":
     demo.launch(server_name="0.0.0.0", server_port=7860)
